@@ -2,16 +2,59 @@ import * as ftp from 'basic-ftp';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
+import * as Sentry from '@sentry/node';
 
 // Load environment variables
 dotenv.config();
+
+// =============================================================================
+// SENTRY CONFIGURATION
+// =============================================================================
+
+// Initialize Sentry only if DSN is provided
+const sentryDsn = process.env.SENTRY_DSN;
+const sentryEnabled = !!sentryDsn;
+
+if (sentryEnabled) {
+  const sentryLoggingEnabled = process.env.SENTRY_LOGGING === 'true';
+  
+  const integrations = [];
+  
+  // Add console logging integration if enabled
+  if (sentryLoggingEnabled) {
+    integrations.push(
+      Sentry.consoleLoggingIntegration({ levels: ["log", "warn", "error"] })
+    );
+  }
+  
+  Sentry.init({
+    dsn: sentryDsn,
+    environment: process.env.SENTRY_ENVIRONMENT || 'production',
+    release: process.env.SENTRY_RELEASE || '1.0.0',
+    integrations,
+    tracesSampleRate: 0.1,
+    // Enable logs to be sent to Sentry (only if logging is enabled)
+    enableLogs: sentryLoggingEnabled,
+    beforeSend(event) {
+      // Don't send FTP credentials or other sensitive data
+      if (event.extra?.ftpConfig) {
+        delete event.extra.ftpConfig;
+      }
+      return event;
+    }
+  });
+  
+  console.log(`[${new Date().toISOString()}] Sentry initialized with environment: ${process.env.SENTRY_ENVIRONMENT || 'production'}${sentryLoggingEnabled ? ' (logging enabled)' : ''}`);
+} else {
+  console.log(`[${new Date().toISOString()}] Sentry not initialized - no DSN provided`);
+}
 
 // =============================================================================
 // CONFIGURATION
 // =============================================================================
 
 // Lock file configuration
-const LOCK_FILE_PATH: string = path.join(__dirname, '.script.lock');
+const LOCK_FILE_PATH: string = process.env.LOCK_FILE_PATH || path.join(__dirname, '.script.lock');
 const LOCK_TIMEOUT_MS: number = 30 * 60 * 1000; // 30 minutes in milliseconds
 
 // FTPS server configuration
@@ -51,6 +94,9 @@ const FILE_STABILITY_THRESHOLD_MS: number = parseInt(process.env.FILE_STABILITY_
 const MAX_CONCURRENT_UPLOADS: number = parseInt(process.env.MAX_CONCURRENT_UPLOADS || "5");
 const MAX_RETRIES: number = parseInt(process.env.MAX_RETRIES || "3");
 const RETRY_BACKOFF_MS: number = 5000;
+
+// Sentry Cron monitoring
+const SENTRY_CRON_MONITOR_ID: string | undefined = process.env.SENTRY_CRON_MONITOR_ID;
 
 // =============================================================================
 // LOCK FILE MANAGEMENT
@@ -176,14 +222,24 @@ async function createFtpClient(): Promise<ftp.Client> {
   const client = new ftp.Client();
   client.ftp.verbose = process.env.FTP_VERBOSE === "true";
   
-  await client.access(FTP_CONFIG);
-  await client.send("TYPE I"); // Set binary mode
-  
-  if (client.ftp.socket) {
-    client.ftp.socket.setKeepAlive(true);
+  try {
+    await client.access(FTP_CONFIG);
+    await client.send("TYPE I"); // Set binary mode
+    
+    if (client.ftp.socket) {
+      client.ftp.socket.setKeepAlive(true);
+    }
+    
+    return client;
+  } catch (error) {
+    if (sentryEnabled) {
+      Sentry.captureException(error, {
+        tags: { operation: 'ftp_connection' },
+        extra: { host: FTP_CONFIG.host, port: FTP_CONFIG.port }
+      });
+    }
+    throw error;
   }
-  
-  return client;
 }
 
 async function uploadFileWithNewClient(
@@ -199,6 +255,18 @@ async function uploadFileWithNewClient(
     await client.send("TYPE I");
     await client.ensureDir(remoteDir);
     await client.uploadFrom(file, remotePath);
+  } catch (error) {
+    if (sentryEnabled) {
+      Sentry.captureException(error, {
+        tags: { operation: 'file_upload' },
+        extra: { 
+          file: path.basename(file),
+          remotePath,
+          remoteDir 
+        }
+      });
+    }
+    throw error;
   } finally {
     client.close();
   }
@@ -348,7 +416,18 @@ async function uploadFiles(): Promise<void> {
   // Create lock file
   createLockFile();
   
+  // Start Sentry cron monitoring if configured
+  let cronCheckInId: string | undefined;
+  if (sentryEnabled && SENTRY_CRON_MONITOR_ID) {
+    cronCheckInId = Sentry.captureCheckIn({
+      monitorSlug: SENTRY_CRON_MONITOR_ID,
+      status: 'in_progress'
+    });
+    console.log(`[${new Date().toISOString()}] Sentry cron monitoring started`);
+  }
+  
   let retries = 0;
+  let success = false;
   
   try {
     while (retries < MAX_RETRIES) {
@@ -372,6 +451,7 @@ async function uploadFiles(): Promise<void> {
           }
           
           // Success - exit retry loop
+          success = true;
           break;
         } finally {
           // Always close the client
@@ -382,6 +462,15 @@ async function uploadFiles(): Promise<void> {
         retries++;
         console.error(`[${new Date().toISOString()}] Error in FTPS process (attempt ${retries}/${MAX_RETRIES}):`, err);
         
+        if (sentryEnabled) {
+          Sentry.captureException(err, {
+            tags: { 
+              operation: 'main_upload_process',
+              retry_attempt: retries 
+            }
+          });
+        }
+        
         if (retries < MAX_RETRIES) {
           const backoffTime = RETRY_BACKOFF_MS * retries;
           console.log(`[${new Date().toISOString()}] Retrying in ${backoffTime/1000} seconds...`);
@@ -390,14 +479,46 @@ async function uploadFiles(): Promise<void> {
       }
     }
   } finally {
+    // Complete Sentry cron monitoring
+    if (sentryEnabled && SENTRY_CRON_MONITOR_ID && cronCheckInId) {
+      Sentry.captureCheckIn({
+        checkInId: cronCheckInId,
+        monitorSlug: SENTRY_CRON_MONITOR_ID,
+        status: success ? 'ok' : 'error'
+      });
+      console.log(`[${new Date().toISOString()}] Sentry cron monitoring completed with status: ${success ? 'ok' : 'error'}`);
+    }
+    
     // Always remove lock file when done
     removeLockFile();
   }
 }
 
+// Global error handlers
+process.on('uncaughtException', (error) => {
+  console.error(`[${new Date().toISOString()}] Uncaught Exception:`, error);
+  if (sentryEnabled) {
+    Sentry.captureException(error, { tags: { type: 'uncaught_exception' } });
+  }
+  removeLockFile();
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (error) => {
+  console.error(`[${new Date().toISOString()}] Unhandled Rejection:`, error);
+  if (sentryEnabled) {
+    Sentry.captureException(error, { tags: { type: 'unhandled_rejection' } });
+  }
+  removeLockFile();
+  process.exit(1);
+});
+
 // Run the script
 uploadFiles().catch(err => {
   console.error(`[${new Date().toISOString()}] Unhandled error:`, err);
+  if (sentryEnabled) {
+    Sentry.captureException(err, { tags: { type: 'main_function_error' } });
+  }
   removeLockFile();
   process.exit(1);
 });
