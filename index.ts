@@ -64,6 +64,7 @@ const FTP_CONFIG = {
   password: process.env.FTP_PASSWORD || "",
   port: parseInt(process.env.FTP_PORT || "21"),
   secure: process.env.FTP_SECURE === "true",
+  secureOptions: { rejectUnauthorized: false },
 };
 
 // Directory paths configuration
@@ -90,8 +91,8 @@ const DIRECTORY_PAIRS: DirectoryPair[] = [
 // File stability threshold (30 seconds by default)
 const FILE_STABILITY_THRESHOLD_MS: number = parseInt(process.env.FILE_STABILITY_THRESHOLD || "30000");
 
-// Upload concurrency settings
-const MAX_CONCURRENT_UPLOADS: number = parseInt(process.env.MAX_CONCURRENT_UPLOADS || "10");
+// Upload concurrency settings - serial uploads for FTPS stability
+const MAX_CONCURRENT_UPLOADS: number = parseInt(process.env.MAX_CONCURRENT_UPLOADS || "1");
 const MAX_RETRIES: number = parseInt(process.env.MAX_RETRIES || "3");
 const RETRY_BACKOFF_MS: number = 5000;
 
@@ -273,100 +274,6 @@ async function retryWithExponentialBackoff<T>(
 }
 
 // =============================================================================
-// FTP CONNECTION POOL
-// =============================================================================
-
-class FtpConnectionPool {
-  private availableClients: ftp.Client[] = [];
-  private activeClients: Set<ftp.Client> = new Set();
-  private readonly maxPoolSize: number;
-  
-  constructor(maxPoolSize: number) {
-    this.maxPoolSize = maxPoolSize;
-  }
-  
-  async acquire(): Promise<ftp.Client> {
-    // Try to get an available client from the pool
-    if (this.availableClients.length > 0) {
-      const client = this.availableClients.pop()!;
-      this.activeClients.add(client);
-      return client;
-    }
-    
-    // Create a new client if we haven't reached the pool size
-    if (this.activeClients.size < this.maxPoolSize) {
-      const client = await this.createNewClient();
-      this.activeClients.add(client);
-      return client;
-    }
-    
-    // Wait for a client to become available (with timeout)
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        clearInterval(checkInterval);
-        reject(new Error('Timeout waiting for available FTP connection from pool'));
-      }, 60000); // 60 second timeout
-      
-      const checkInterval = setInterval(() => {
-        if (this.availableClients.length > 0) {
-          clearInterval(checkInterval);
-          clearTimeout(timeout);
-          const client = this.availableClients.pop()!;
-          this.activeClients.add(client);
-          resolve(client);
-        }
-      }, 100);
-    });
-  }
-  
-  release(client: ftp.Client): void {
-    this.activeClients.delete(client);
-    // Only keep the client if it's still connected
-    if (client.closed === false) {
-      this.availableClients.push(client);
-    }
-  }
-  
-  private async createNewClient(): Promise<ftp.Client> {
-    const client = new ftp.Client();
-    client.ftp.verbose = false;
-    
-    try {
-      await client.access(FTP_CONFIG);
-      await client.send("TYPE I");
-      
-      if (client.ftp.socket) {
-        client.ftp.socket.setKeepAlive(true);
-      }
-      
-      return client;
-    } catch (error) {
-      if (sentryEnabled) {
-        Sentry.captureException(error, {
-          tags: { operation: 'ftp_connection_pool' },
-          extra: { host: FTP_CONFIG.host, port: FTP_CONFIG.port }
-        });
-      }
-      throw error;
-    }
-  }
-  
-  async closeAll(): Promise<void> {
-    // Close all available clients
-    for (const client of this.availableClients) {
-      client.close();
-    }
-    this.availableClients = [];
-    
-    // Close all active clients
-    for (const client of this.activeClients) {
-      client.close();
-    }
-    this.activeClients.clear();
-  }
-}
-
-// =============================================================================
 // FTP OPERATIONS
 // =============================================================================
 
@@ -394,35 +301,77 @@ async function createFtpClient(): Promise<ftp.Client> {
   }
 }
 
-async function uploadFileWithPooledClient(
-  file: string, 
-  remotePath: string, 
-  remoteDir: string,
-  connectionPool: FtpConnectionPool
-): Promise<void> {
-  const fileName = path.basename(file);
+/**
+ * Ensures a directory exists by navigating to it step by step.
+ * Handles 550 errors (directory already exists) gracefully.
+ */
+async function ensureDirWithCwd(client: ftp.Client, remotePath: string): Promise<void> {
+  // Normalize path and split into parts
+  const normalizedPath = remotePath.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!normalizedPath) return;
   
+  const parts = normalizedPath.split('/');
+  
+  // Navigate to root first
+  try {
+    await client.cd('/');
+  } catch (error) {
+    console.log(`Could not navigate to root: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  
+  // Create and navigate each directory part
+  for (const part of parts) {
+    if (!part) continue;
+    
+    try {
+      // Try to create directory (will fail with 550 if exists)
+      await client.send(`MKD ${part}`);
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      // Ignore 550 errors (directory exists), but log other errors
+      if (!errorMsg.includes('550')) {
+        console.log(`Warning creating directory ${part}: ${errorMsg}`);
+      }
+    }
+    
+    // Navigate into the directory
+    try {
+      await client.cd(part);
+    } catch (error) {
+      throw new Error(`Failed to navigate to directory ${part}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+/**
+ * Upload a single file using CWD + relative path approach
+ */
+async function uploadFileWithCwd(
+  client: ftp.Client,
+  localFilePath: string,
+  remoteDir: string,
+  fileName: string
+): Promise<void> {
   await retryWithExponentialBackoff(
     async () => {
-      const client = await connectionPool.acquire();
-      
       try {
-        await client.ensureDir(remoteDir);
-        await client.uploadFrom(file, remotePath);
+        // Navigate to the remote directory
+        await ensureDirWithCwd(client, remoteDir);
+        
+        // Upload using relative filename only
+        await client.uploadFrom(localFilePath, fileName);
       } catch (error) {
         if (sentryEnabled) {
           Sentry.captureException(error, {
             tags: { operation: 'file_upload' },
             extra: { 
               file: fileName,
-              remotePath,
-              remoteDir 
+              remoteDir,
+              localFilePath
             }
           });
         }
         throw error;
-      } finally {
-        connectionPool.release(client);
       }
     },
     FILE_UPLOAD_MAX_RETRIES,
@@ -432,52 +381,35 @@ async function uploadFileWithPooledClient(
   );
 }
 
-async function uploadFilesInParallel(
+/**
+ * Upload files serially (one at a time) using a single connection
+ */
+async function uploadFilesSerially(
+  client: ftp.Client,
   files: string[], 
   folderPath: string, 
-  remoteFolderPath: string,
-  remoteDir: string,
-  connectionPool: FtpConnectionPool
+  remoteFolderPath: string
 ): Promise<boolean> {
   let uploadErrors = 0;
-  const filesToProcess = [...files];
-  const activePromises: Promise<void>[] = [];
   
-  // Process files in batches to maintain concurrency limit
-  while (filesToProcess.length > 0 || activePromises.length > 0) {
-    // Start new uploads if under limit
-    while (activePromises.length < MAX_CONCURRENT_UPLOADS && filesToProcess.length > 0) {
-      const file = filesToProcess.shift()!;
-      const relativePath = path.relative(folderPath, file).replace(/\\/g, '/');
-      const remotePath = path.posix.join(remoteFolderPath, relativePath);
-      
-      console.log(`Starting upload ${activePromises.length+1}/${MAX_CONCURRENT_UPLOADS}: ${path.basename(file)}`);
-      
-      const uploadPromise = uploadFileWithPooledClient(file, remotePath, remoteDir, connectionPool)
-        .then(() => console.log(`Completed upload: ${path.basename(file)}`))
-        .catch(err => {
-          console.error(`Error uploading ${path.basename(file)}:`, err);
-          uploadErrors++;
-          return Promise.resolve(); // Continue despite error
-        });
-      
-      // Track this promise and remove it when done
-      const trackingPromise = uploadPromise.finally(() => {
-        const index = activePromises.indexOf(trackingPromise);
-        if (index !== -1) activePromises.splice(index, 1);
-      });
-      
-      activePromises.push(trackingPromise);
-    }
+  for (const file of files) {
+    const relativePath = path.relative(folderPath, file).replace(/\\/g, '/');
+    const fileName = path.basename(file);
+    const remoteDir = path.posix.join(remoteFolderPath, path.posix.dirname(relativePath));
     
-    // If we've hit the limit or exhausted files, wait for some to complete
-    if (activePromises.length > 0) {
-      await Promise.race(activePromises);
+    console.log(`Uploading: ${fileName} to ${remoteDir}`);
+    
+    try {
+      await uploadFileWithCwd(client, file, remoteDir, fileName);
+      console.log(`Completed upload: ${fileName}`);
+    } catch (err) {
+      console.error(`Error uploading ${fileName}:`, err);
+      uploadErrors++;
     }
   }
   
   if (uploadErrors > 0) {
-    console.log(`${uploadErrors} files failed to upload in directory ${remoteDir}`);
+    console.log(`${uploadErrors} files failed to upload`);
     return false;
   }
   
@@ -488,7 +420,7 @@ async function uploadFilesInParallel(
 // FOLDER PROCESSING
 // =============================================================================
 
-async function processFolder(folderPath: string, client: ftp.Client, remoteBaseDir: string, connectionPool: FtpConnectionPool): Promise<boolean> {
+async function processFolder(folderPath: string, client: ftp.Client, remoteBaseDir: string): Promise<boolean> {
   const folderName = path.basename(folderPath);
   console.log(`\nProcessing folder: ${folderName}`);
   
@@ -512,39 +444,17 @@ async function processFolder(folderPath: string, client: ftp.Client, remoteBaseD
     
     // Create remote directory structure
     const remoteFolderPath = path.posix.join(remoteBaseDir, folderName);
-    await client.ensureDir(remoteFolderPath);
     
-    // Group files by directory
-    const filesByDir: Record<string, string[]> = {};
-    for (const file of files) {
-      const relativePath = path.relative(folderPath, file).replace(/\\/g, '/');
-      const remoteDir = path.posix.dirname(path.posix.join(remoteFolderPath, relativePath));
-      
-      if (!filesByDir[remoteDir]) filesByDir[remoteDir] = [];
-      filesByDir[remoteDir].push(file);
-    }
-    
-    // Upload files directory by directory
-    let allSuccessful = true;
-    
-    for (const remoteDir of Object.keys(filesByDir)) {
-      // Ensure directory exists on remote server
-      await client.ensureDir(remoteDir);
-      
-      // Upload files in this directory in parallel
-      const success = await uploadFilesInParallel(
-        filesByDir[remoteDir], 
-        folderPath, 
-        remoteFolderPath,
-        remoteDir,
-        connectionPool
-      );
-      
-      if (!success) allSuccessful = false;
-    }
+    // Upload all files serially
+    const success = await uploadFilesSerially(
+      client,
+      files, 
+      folderPath, 
+      remoteFolderPath
+    );
     
     // Clean up if all files uploaded successfully
-    if (allSuccessful) {
+    if (success) {
       console.log(`All files uploaded successfully, deleting folder: ${folderName}`);
       
       // Delete files first, then directories
@@ -593,11 +503,8 @@ async function uploadFiles(): Promise<void> {
   
   try {
     while (retries < MAX_RETRIES) {
-      // Create connection pool for parallel uploads
-      const connectionPool = new FtpConnectionPool(MAX_CONCURRENT_UPLOADS);
-      
       try {
-        // Create main FTP client
+        // Create single FTP client for all uploads
         console.log(`[${new Date().toISOString()}] Connecting to FTPS server...`);
         const client = await createFtpClient();
         
@@ -611,7 +518,7 @@ async function uploadFiles(): Promise<void> {
             console.log(`[${new Date().toISOString()}] Found ${folders.length} folders to process in ${dirPair.localDir}`);
             
             for (const folder of folders) {
-              await processFolder(folder, client, dirPair.remoteDir, connectionPool);
+              await processFolder(folder, client, dirPair.remoteDir);
             }
           }
           
@@ -619,9 +526,8 @@ async function uploadFiles(): Promise<void> {
           success = true;
           break;
         } finally {
-          // Always close the client and connection pool
+          // Always close the client
           client.close();
-          await connectionPool.closeAll();
           console.log(`[${new Date().toISOString()}] FTPS connection closed`);
         }
       } catch (err) {
