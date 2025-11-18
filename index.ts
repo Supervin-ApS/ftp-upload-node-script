@@ -300,11 +300,17 @@ class FtpConnectionPool {
       return client;
     }
     
-    // Wait for a client to become available
-    return new Promise((resolve) => {
+    // Wait for a client to become available (with timeout)
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        clearInterval(checkInterval);
+        reject(new Error('Timeout waiting for available FTP connection from pool'));
+      }, 60000); // 60 second timeout
+      
       const checkInterval = setInterval(() => {
         if (this.availableClients.length > 0) {
           clearInterval(checkInterval);
+          clearTimeout(timeout);
           const client = this.availableClients.pop()!;
           this.activeClients.add(client);
           resolve(client);
