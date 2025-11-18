@@ -95,6 +95,11 @@ const MAX_CONCURRENT_UPLOADS: number = parseInt(process.env.MAX_CONCURRENT_UPLOA
 const MAX_RETRIES: number = parseInt(process.env.MAX_RETRIES || "3");
 const RETRY_BACKOFF_MS: number = 5000;
 
+// File upload retry settings - more aggressive for handling network instability
+const FILE_UPLOAD_MAX_RETRIES: number = parseInt(process.env.FILE_UPLOAD_MAX_RETRIES || "10");
+const FILE_UPLOAD_INITIAL_BACKOFF_MS: number = parseInt(process.env.FILE_UPLOAD_INITIAL_BACKOFF_MS || "2000");
+const FILE_UPLOAD_MAX_BACKOFF_MS: number = parseInt(process.env.FILE_UPLOAD_MAX_BACKOFF_MS || "60000");
+
 // Sentry Cron monitoring
 const SENTRY_CRON_MONITOR_ID: string | undefined = process.env.SENTRY_CRON_MONITOR_ID;
 
@@ -215,6 +220,59 @@ async function deleteDirectoryRecursive(dirPath: string): Promise<void> {
 }
 
 // =============================================================================
+// RETRY UTILITIES
+// =============================================================================
+
+/**
+ * Executes an async function with exponential backoff retry logic.
+ * @param fn The async function to execute
+ * @param maxRetries Maximum number of retry attempts
+ * @param initialBackoffMs Initial backoff time in milliseconds
+ * @param maxBackoffMs Maximum backoff time in milliseconds
+ * @param operationName Name of the operation for logging
+ * @returns Result of the function
+ */
+async function retryWithExponentialBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number,
+  initialBackoffMs: number,
+  maxBackoffMs: number,
+  operationName: string
+): Promise<T> {
+  let lastError: Error | undefined;
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error as Error;
+      
+      if (attempt < maxRetries) {
+        // Calculate exponential backoff with cap
+        const backoffTime = Math.min(
+          initialBackoffMs * Math.pow(2, attempt),
+          maxBackoffMs
+        );
+        
+        console.log(
+          `[${new Date().toISOString()}] ${operationName} failed (attempt ${attempt + 1}/${maxRetries + 1}). ` +
+          `Retrying in ${backoffTime}ms... Error: ${error instanceof Error ? error.message : String(error)}`
+        );
+        
+        await new Promise(resolve => setTimeout(resolve, backoffTime));
+      } else {
+        console.error(
+          `[${new Date().toISOString()}] ${operationName} failed after ${maxRetries + 1} attempts. ` +
+          `Error: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+  }
+  
+  throw lastError;
+}
+
+// =============================================================================
 // FTP OPERATIONS
 // =============================================================================
 
@@ -247,29 +305,39 @@ async function uploadFileWithNewClient(
   remotePath: string, 
   remoteDir: string
 ): Promise<void> {
-  const client = new ftp.Client();
-  client.ftp.verbose = false;
+  const fileName = path.basename(file);
   
-  try {
-    await client.access(FTP_CONFIG);
-    await client.send("TYPE I");
-    await client.ensureDir(remoteDir);
-    await client.uploadFrom(file, remotePath);
-  } catch (error) {
-    if (sentryEnabled) {
-      Sentry.captureException(error, {
-        tags: { operation: 'file_upload' },
-        extra: { 
-          file: path.basename(file),
-          remotePath,
-          remoteDir 
+  await retryWithExponentialBackoff(
+    async () => {
+      const client = new ftp.Client();
+      client.ftp.verbose = false;
+      
+      try {
+        await client.access(FTP_CONFIG);
+        await client.send("TYPE I");
+        await client.ensureDir(remoteDir);
+        await client.uploadFrom(file, remotePath);
+      } catch (error) {
+        if (sentryEnabled) {
+          Sentry.captureException(error, {
+            tags: { operation: 'file_upload' },
+            extra: { 
+              file: fileName,
+              remotePath,
+              remoteDir 
+            }
+          });
         }
-      });
-    }
-    throw error;
-  } finally {
-    client.close();
-  }
+        throw error;
+      } finally {
+        client.close();
+      }
+    },
+    FILE_UPLOAD_MAX_RETRIES,
+    FILE_UPLOAD_INITIAL_BACKOFF_MS,
+    FILE_UPLOAD_MAX_BACKOFF_MS,
+    `Upload ${fileName}`
+  );
 }
 
 async function uploadFilesInParallel(
