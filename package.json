@@ -8,6 +8,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node dist/index.js",
+    "start:bun": "bun run dist/index.js",
     "build": "npx tsc",
     "start:build": "npm run build && node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
