@@ -448,7 +448,7 @@ async function uploadFilesInParallel(
     // Start new uploads if under limit
     while (activePromises.length < MAX_CONCURRENT_UPLOADS && filesToProcess.length > 0) {
       const file = filesToProcess.shift()!;
-      const relativePath = path.relative(folderPath, file);
+      const relativePath = path.relative(folderPath, file).replace(/\\/g, '/');
       const remotePath = path.posix.join(remoteFolderPath, relativePath);
       
       console.log(`Starting upload ${activePromises.length+1}/${MAX_CONCURRENT_UPLOADS}: ${path.basename(file)}`);
@@ -517,7 +517,7 @@ async function processFolder(folderPath: string, client: ftp.Client, remoteBaseD
     // Group files by directory
     const filesByDir: Record<string, string[]> = {};
     for (const file of files) {
-      const relativePath = path.relative(folderPath, file);
+      const relativePath = path.relative(folderPath, file).replace(/\\/g, '/');
       const remoteDir = path.posix.dirname(path.posix.join(remoteFolderPath, relativePath));
       
       if (!filesByDir[remoteDir]) filesByDir[remoteDir] = [];
