@@ -1,4 +1,5 @@
-import * as ftp from 'basic-ftp';
+import { S3Client, PutObjectCommand, HeadBucketCommand } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
@@ -36,9 +37,9 @@ if (sentryEnabled) {
     // Enable logs to be sent to Sentry (only if logging is enabled)
     enableLogs: sentryLoggingEnabled,
     beforeSend(event) {
-      // Don't send FTP credentials or other sensitive data
-      if (event.extra?.ftpConfig) {
-        delete event.extra.ftpConfig;
+      // Don't send S3 credentials or other sensitive data
+      if (event.extra?.s3Config) {
+        delete event.extra.s3Config;
       }
       return event;
     }
@@ -57,19 +58,20 @@ if (sentryEnabled) {
 const LOCK_FILE_PATH: string = process.env.LOCK_FILE_PATH || path.join(__dirname, '.script.lock');
 const LOCK_TIMEOUT_MS: number = 30 * 60 * 1000; // 30 minutes in milliseconds
 
-// FTPS server configuration
-const FTP_CONFIG = {
-  host: process.env.FTP_HOST || "185.21.43.26",
-  user: process.env.FTP_USER || "imageupload",
-  password: process.env.FTP_PASSWORD || "",
-  port: parseInt(process.env.FTP_PORT || "21"),
-  secure: process.env.FTP_SECURE === "true",
+// S3/MinIO configuration
+const S3_CONFIG = {
+  endpoint: process.env.S3_ENDPOINT || "http://localhost:9000",
+  region: process.env.S3_REGION || "us-east-1",
+  accessKeyId: process.env.S3_ACCESS_KEY_ID || "",
+  secretAccessKey: process.env.S3_SECRET_ACCESS_KEY || "",
+  forcePathStyle: process.env.S3_FORCE_PATH_STYLE !== "false", // MinIO requires path-style
 };
 
 // Directory paths configuration
 interface DirectoryPair {
   localDir: string;
-  remoteDir: string;
+  bucket: string;
+  prefix: string;
   description: string;
 }
 
@@ -77,12 +79,14 @@ interface DirectoryPair {
 const DIRECTORY_PAIRS: DirectoryPair[] = [
   {
     localDir: process.env.LOCAL_DIR_IMAGES || "./websiteImages",
-    remoteDir: process.env.REMOTE_DIR_IMAGES || "/testImages",
+    bucket: process.env.S3_BUCKET_IMAGES || "images",
+    prefix: process.env.S3_PREFIX_IMAGES || "testImages",
     description: "Regular Images"
   },
   {
     localDir: process.env.LOCAL_DIR_360 || "./360Images",
-    remoteDir: process.env.REMOTE_DIR_360 || "/360Images", 
+    bucket: process.env.S3_BUCKET_360 || "images-360", 
+    prefix: process.env.S3_PREFIX_360 || "360Images",
     description: "360-degree Images"
   }
 ];
@@ -273,156 +277,130 @@ async function retryWithExponentialBackoff<T>(
 }
 
 // =============================================================================
-// FTP CONNECTION POOL
+// S3 CLIENT POOL
 // =============================================================================
 
-class FtpConnectionPool {
-  private availableClients: ftp.Client[] = [];
-  private activeClients: Set<ftp.Client> = new Set();
+class S3ClientPool {
+  private clients: S3Client[] = [];
   private readonly maxPoolSize: number;
+  private currentIndex: number = 0;
   
   constructor(maxPoolSize: number) {
     this.maxPoolSize = maxPoolSize;
+    // Pre-create S3 clients for the pool
+    for (let i = 0; i < maxPoolSize; i++) {
+      this.clients.push(this.createNewClient());
+    }
   }
   
-  async acquire(): Promise<ftp.Client> {
-    // Try to get an available client from the pool
-    if (this.availableClients.length > 0) {
-      const client = this.availableClients.pop()!;
-      this.activeClients.add(client);
-      return client;
-    }
-    
-    // Create a new client if we haven't reached the pool size
-    if (this.activeClients.size < this.maxPoolSize) {
-      const client = await this.createNewClient();
-      this.activeClients.add(client);
-      return client;
-    }
-    
-    // Wait for a client to become available (with timeout)
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        clearInterval(checkInterval);
-        reject(new Error('Timeout waiting for available FTP connection from pool'));
-      }, 60000); // 60 second timeout
-      
-      const checkInterval = setInterval(() => {
-        if (this.availableClients.length > 0) {
-          clearInterval(checkInterval);
-          clearTimeout(timeout);
-          const client = this.availableClients.pop()!;
-          this.activeClients.add(client);
-          resolve(client);
-        }
-      }, 100);
+  getClient(): S3Client {
+    // Round-robin distribution of clients
+    const client = this.clients[this.currentIndex];
+    this.currentIndex = (this.currentIndex + 1) % this.clients.length;
+    return client;
+  }
+  
+  private createNewClient(): S3Client {
+    return new S3Client({
+      endpoint: S3_CONFIG.endpoint,
+      region: S3_CONFIG.region,
+      credentials: {
+        accessKeyId: S3_CONFIG.accessKeyId,
+        secretAccessKey: S3_CONFIG.secretAccessKey,
+      },
+      forcePathStyle: S3_CONFIG.forcePathStyle,
     });
   }
   
-  release(client: ftp.Client): void {
-    this.activeClients.delete(client);
-    // Only keep the client if it's still connected
-    if (client.closed === false) {
-      this.availableClients.push(client);
-    }
-  }
-  
-  private async createNewClient(): Promise<ftp.Client> {
-    const client = new ftp.Client();
-    client.ftp.verbose = false;
-    
-    try {
-      await client.access(FTP_CONFIG);
-      await client.send("TYPE I");
-      
-      if (client.ftp.socket) {
-        client.ftp.socket.setKeepAlive(true);
-      }
-      
-      return client;
-    } catch (error) {
-      if (sentryEnabled) {
-        Sentry.captureException(error, {
-          tags: { operation: 'ftp_connection_pool' },
-          extra: { host: FTP_CONFIG.host, port: FTP_CONFIG.port }
-        });
-      }
-      throw error;
-    }
-  }
-  
   async closeAll(): Promise<void> {
-    // Close all available clients
-    for (const client of this.availableClients) {
-      client.close();
+    for (const client of this.clients) {
+      client.destroy();
     }
-    this.availableClients = [];
-    
-    // Close all active clients
-    for (const client of this.activeClients) {
-      client.close();
-    }
-    this.activeClients.clear();
+    this.clients = [];
   }
 }
 
 // =============================================================================
-// FTP OPERATIONS
+// S3 OPERATIONS
 // =============================================================================
 
-async function createFtpClient(): Promise<ftp.Client> {
-  const client = new ftp.Client();
-  client.ftp.verbose = process.env.FTP_VERBOSE === "true";
-  
+async function createS3Client(): Promise<S3Client> {
   try {
-    await client.access(FTP_CONFIG);
-    await client.send("TYPE I"); // Set binary mode
-    
-    if (client.ftp.socket) {
-      client.ftp.socket.setKeepAlive(true);
-    }
+    const client = new S3Client({
+      endpoint: S3_CONFIG.endpoint,
+      region: S3_CONFIG.region,
+      credentials: {
+        accessKeyId: S3_CONFIG.accessKeyId,
+        secretAccessKey: S3_CONFIG.secretAccessKey,
+      },
+      forcePathStyle: S3_CONFIG.forcePathStyle,
+    });
     
     return client;
   } catch (error) {
     if (sentryEnabled) {
       Sentry.captureException(error, {
-        tags: { operation: 'ftp_connection' },
-        extra: { host: FTP_CONFIG.host, port: FTP_CONFIG.port }
+        tags: { operation: 's3_connection' },
+        extra: { endpoint: S3_CONFIG.endpoint, region: S3_CONFIG.region }
       });
     }
     throw error;
   }
 }
 
-async function uploadFileWithPooledClient(
+async function uploadFileToS3(
   file: string, 
-  remotePath: string, 
-  remoteDir: string,
-  connectionPool: FtpConnectionPool
+  s3Key: string, 
+  bucket: string,
+  clientPool: S3ClientPool
 ): Promise<void> {
   const fileName = path.basename(file);
   
   await retryWithExponentialBackoff(
     async () => {
-      const client = await connectionPool.acquire();
+      const client = clientPool.getClient();
       
       try {
-        await client.ensureDir(remoteDir);
-        await client.uploadFrom(file, remotePath);
+        const fileStream = fs.createReadStream(file);
+        const stats = await fs.promises.stat(file);
+        
+        // Use multipart upload for files larger than 5MB
+        if (stats.size > 5 * 1024 * 1024) {
+          const upload = new Upload({
+            client,
+            params: {
+              Bucket: bucket,
+              Key: s3Key,
+              Body: fileStream,
+            },
+            queueSize: 4,
+            partSize: 5 * 1024 * 1024, // 5MB parts
+            leavePartsOnError: false,
+          });
+          
+          await upload.done();
+        } else {
+          // Use simple upload for smaller files
+          const command = new PutObjectCommand({
+            Bucket: bucket,
+            Key: s3Key,
+            Body: fileStream,
+          });
+          
+          await client.send(command);
+        }
       } catch (error) {
         if (sentryEnabled) {
           Sentry.captureException(error, {
             tags: { operation: 'file_upload' },
             extra: { 
               file: fileName,
-              remotePath,
-              remoteDir 
+              s3Key,
+              bucket 
             }
           });
         }
         throw error;
-      } finally {
-        connectionPool.release(client);
       }
     },
     FILE_UPLOAD_MAX_RETRIES,
@@ -435,9 +413,9 @@ async function uploadFileWithPooledClient(
 async function uploadFilesInParallel(
   files: string[], 
   folderPath: string, 
-  remoteFolderPath: string,
-  remoteDir: string,
-  connectionPool: FtpConnectionPool
+  s3Prefix: string,
+  bucket: string,
+  clientPool: S3ClientPool
 ): Promise<boolean> {
   let uploadErrors = 0;
   const filesToProcess = [...files];
@@ -449,11 +427,12 @@ async function uploadFilesInParallel(
     while (activePromises.length < MAX_CONCURRENT_UPLOADS && filesToProcess.length > 0) {
       const file = filesToProcess.shift()!;
       const relativePath = path.relative(folderPath, file);
-      const remotePath = path.posix.join(remoteFolderPath, relativePath);
+      // Use forward slashes for S3 keys
+      const s3Key = path.posix.join(s3Prefix, relativePath.replace(/\\/g, '/'));
       
       console.log(`Starting upload ${activePromises.length+1}/${MAX_CONCURRENT_UPLOADS}: ${path.basename(file)}`);
       
-      const uploadPromise = uploadFileWithPooledClient(file, remotePath, remoteDir, connectionPool)
+      const uploadPromise = uploadFileToS3(file, s3Key, bucket, clientPool)
         .then(() => console.log(`Completed upload: ${path.basename(file)}`))
         .catch(err => {
           console.error(`Error uploading ${path.basename(file)}:`, err);
@@ -477,7 +456,7 @@ async function uploadFilesInParallel(
   }
   
   if (uploadErrors > 0) {
-    console.log(`${uploadErrors} files failed to upload in directory ${remoteDir}`);
+    console.log(`${uploadErrors} files failed to upload to bucket ${bucket}`);
     return false;
   }
   
@@ -488,7 +467,7 @@ async function uploadFilesInParallel(
 // FOLDER PROCESSING
 // =============================================================================
 
-async function processFolder(folderPath: string, client: ftp.Client, remoteBaseDir: string, connectionPool: FtpConnectionPool): Promise<boolean> {
+async function processFolder(folderPath: string, s3Prefix: string, bucket: string, clientPool: S3ClientPool): Promise<boolean> {
   const folderName = path.basename(folderPath);
   console.log(`\nProcessing folder: ${folderName}`);
   
@@ -510,41 +489,20 @@ async function processFolder(folderPath: string, client: ftp.Client, remoteBaseD
       }
     }
     
-    // Create remote directory structure
-    const remoteFolderPath = path.posix.join(remoteBaseDir, folderName);
-    await client.ensureDir(remoteFolderPath);
+    // Create S3 prefix (folder structure in bucket)
+    const s3FolderPrefix = path.posix.join(s3Prefix, folderName);
     
-    // Group files by directory
-    const filesByDir: Record<string, string[]> = {};
-    for (const file of files) {
-      const relativePath = path.relative(folderPath, file);
-      const remoteDir = path.posix.dirname(path.posix.join(remoteFolderPath, relativePath));
-      
-      if (!filesByDir[remoteDir]) filesByDir[remoteDir] = [];
-      filesByDir[remoteDir].push(file);
-    }
-    
-    // Upload files directory by directory
-    let allSuccessful = true;
-    
-    for (const remoteDir of Object.keys(filesByDir)) {
-      // Ensure directory exists on remote server
-      await client.ensureDir(remoteDir);
-      
-      // Upload files in this directory in parallel
-      const success = await uploadFilesInParallel(
-        filesByDir[remoteDir], 
-        folderPath, 
-        remoteFolderPath,
-        remoteDir,
-        connectionPool
-      );
-      
-      if (!success) allSuccessful = false;
-    }
+    // Upload all files in parallel
+    const success = await uploadFilesInParallel(
+      files, 
+      folderPath, 
+      s3FolderPrefix,
+      bucket,
+      clientPool
+    );
     
     // Clean up if all files uploaded successfully
-    if (allSuccessful) {
+    if (success) {
       console.log(`All files uploaded successfully, deleting folder: ${folderName}`);
       
       // Delete files first, then directories
@@ -593,25 +551,36 @@ async function uploadFiles(): Promise<void> {
   
   try {
     while (retries < MAX_RETRIES) {
-      // Create connection pool for parallel uploads
-      const connectionPool = new FtpConnectionPool(MAX_CONCURRENT_UPLOADS);
+      // Create S3 client pool for parallel uploads
+      const clientPool = new S3ClientPool(MAX_CONCURRENT_UPLOADS);
       
       try {
-        // Create main FTP client
-        console.log(`[${new Date().toISOString()}] Connecting to FTPS server...`);
-        const client = await createFtpClient();
+        // Create main S3 client for bucket verification
+        console.log(`[${new Date().toISOString()}] Connecting to S3/MinIO server...`);
+        const client = await createS3Client();
         
         try {
+          // Verify buckets exist
+          for (const dirPair of DIRECTORY_PAIRS) {
+            try {
+              await client.send(new HeadBucketCommand({ Bucket: dirPair.bucket }));
+              console.log(`[${new Date().toISOString()}] Verified bucket exists: ${dirPair.bucket}`);
+            } catch (err) {
+              console.error(`[${new Date().toISOString()}] Bucket ${dirPair.bucket} does not exist or is not accessible:`, err);
+              throw new Error(`Bucket ${dirPair.bucket} is not accessible`);
+            }
+          }
+          
           // Process each directory pair
           for (const dirPair of DIRECTORY_PAIRS) {
-            console.log(`[${new Date().toISOString()}] Processing ${dirPair.description}: ${dirPair.localDir} -> ${dirPair.remoteDir}`);
+            console.log(`[${new Date().toISOString()}] Processing ${dirPair.description}: ${dirPair.localDir} -> s3://${dirPair.bucket}/${dirPair.prefix}`);
             
             // Process all folders in this local directory
             const folders = await getRootFolders(dirPair.localDir);
             console.log(`[${new Date().toISOString()}] Found ${folders.length} folders to process in ${dirPair.localDir}`);
             
             for (const folder of folders) {
-              await processFolder(folder, client, dirPair.remoteDir, connectionPool);
+              await processFolder(folder, dirPair.prefix, dirPair.bucket, clientPool);
             }
           }
           
@@ -619,14 +588,14 @@ async function uploadFiles(): Promise<void> {
           success = true;
           break;
         } finally {
-          // Always close the client and connection pool
-          client.close();
-          await connectionPool.closeAll();
-          console.log(`[${new Date().toISOString()}] FTPS connection closed`);
+          // Always close the client pool
+          client.destroy();
+          await clientPool.closeAll();
+          console.log(`[${new Date().toISOString()}] S3 connections closed`);
         }
       } catch (err) {
         retries++;
-        console.error(`[${new Date().toISOString()}] Error in FTPS process (attempt ${retries}/${MAX_RETRIES}):`, err);
+        console.error(`[${new Date().toISOString()}] Error in S3 upload process (attempt ${retries}/${MAX_RETRIES}):`, err);
         
         if (sentryEnabled) {
           Sentry.captureException(err, {
