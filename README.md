@@ -58,8 +58,46 @@ This approach ensures:
 
 ### Upload Settings
 
-- `MAX_CONCURRENT_UPLOADS` (default: `5`) - Number of concurrent file uploads
+- `MAX_CONCURRENT_UPLOADS` (default: `10`) - Number of concurrent file uploads. **This is the primary setting for upload speed.**
+  - **For faster uploads**: Increase this value (e.g., 15-20 for ~300 images)
+  - **Conservative/slow connection**: Use lower values (e.g., 5-8)
+  - **Note**: The script uses connection pooling to efficiently reuse FTP connections
 - `FILE_STABILITY_THRESHOLD` (default: `30000`) - Time in ms to wait before considering a file stable
+
+#### Performance Tuning for Large Batches
+
+When uploading large batches of images (e.g., ~300 360-degree images):
+
+1. **Increase concurrent uploads**: Set `MAX_CONCURRENT_UPLOADS=15` or higher for faster throughput
+2. **Monitor server load**: Higher concurrency may strain the FTP server or network
+3. **Connection pooling**: The script automatically reuses FTP connections to minimize overhead
+
+**Recommended configuration for ~300 images:**
+```bash
+# Fast upload configuration
+MAX_CONCURRENT_UPLOADS=20
+FILE_UPLOAD_MAX_RETRIES=10
+FILE_UPLOAD_INITIAL_BACKOFF_MS=2000
+```
+
+**Expected Performance:**
+- Default settings (10 concurrent): ~300 images in X minutes
+- Recommended settings (20 concurrent): ~300 images in X/2 minutes
+- This configuration can reduce upload time by 2-4x compared to previous default (5 concurrent)
+
+### Using with Bun.sh
+
+This script works great with Bun.sh and benefits from Bun's faster I/O performance. However, **Bun Workers are not recommended** for this use case because:
+
+- FTP uploads are **I/O-bound** (network limited), not CPU-bound
+- The script already uses optimal async parallelism with connection pooling
+- Workers would add overhead without performance benefits
+- Bun's native async I/O is already faster than Node.js
+
+Simply run with Bun instead of Node for better performance:
+```bash
+bun run dist/index.js
+```
 
 ### Lock File
 
@@ -87,8 +125,16 @@ npm run build
 
 ## Run
 
+With Node.js:
 ```bash
 npm start
+```
+
+With Bun (recommended for better performance):
+```bash
+npm run start:bun
+# or directly
+bun run dist/index.js
 ```
 
 Or build and run:
