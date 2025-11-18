@@ -72,7 +72,7 @@ When uploading large batches of images (e.g., ~300 360-degree images):
 2. **Monitor server load**: Higher concurrency may strain the FTP server or network
 3. **Connection pooling**: The script automatically reuses FTP connections to minimize overhead
 
-**Example for ~300 images:**
+**Recommended configuration for ~300 images:**
 ```bash
 # Fast upload configuration
 MAX_CONCURRENT_UPLOADS=20
@@ -80,7 +80,10 @@ FILE_UPLOAD_MAX_RETRIES=10
 FILE_UPLOAD_INITIAL_BACKOFF_MS=2000
 ```
 
-This configuration can reduce upload time by 2-4x compared to the default settings.
+**Expected Performance:**
+- Default settings (10 concurrent): ~300 images in X minutes
+- Recommended settings (20 concurrent): ~300 images in X/2 minutes
+- This configuration can reduce upload time by 2-4x compared to previous default (5 concurrent)
 
 ### Using with Bun.sh
 
