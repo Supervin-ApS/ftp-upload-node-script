@@ -4,6 +4,8 @@ A robust Node.js TypeScript application for uploading files to an FTP server wit
 
 ## Features
 
+- **Dedicated FTP Connection Per File**: Each file upload uses a fresh FTP connection, eliminating connection reuse issues
+- **Socket Timeout Protection**: Configurable socket timeout prevents hanging connections
 - **Robust Retry Mechanism**: Automatic retry with exponential backoff for failed uploads
 - **Parallel Uploads**: Configurable concurrent upload support
 - **Network Error Handling**: Handles timeout errors and FTP network stream errors (426)
@@ -48,6 +50,7 @@ This approach ensures:
 - `FTP_PORT` (default: `21`) - FTP server port
 - `FTP_SECURE` (default: `false`) - Use FTPS if set to `true`
 - `FTP_VERBOSE` (default: `false`) - Enable verbose FTP logging
+- `FTP_SOCKET_TIMEOUT_MS` (default: `30000`) - Socket timeout in milliseconds to prevent hanging connections
 
 ### Directory Configuration
 
@@ -58,10 +61,10 @@ This approach ensures:
 
 ### Upload Settings
 
-- `MAX_CONCURRENT_UPLOADS` (default: `10`) - Number of concurrent file uploads. **This is the primary setting for upload speed.**
+- `MAX_CONCURRENT_UPLOADS` (default: `10`) - Number of concurrent file uploads. **Each file gets its own dedicated FTP connection.**
   - **For faster uploads**: Increase this value (e.g., 15-20 for ~300 images)
   - **Conservative/slow connection**: Use lower values (e.g., 5-8)
-  - **Note**: The script uses connection pooling to efficiently reuse FTP connections
+  - **Note**: Each concurrent upload creates a separate FTP connection to maximize reliability
 - `FILE_STABILITY_THRESHOLD` (default: `30000`) - Time in ms to wait before considering a file stable
 
 #### Performance Tuning for Large Batches
@@ -74,8 +77,9 @@ When uploading large batches of images (e.g., ~300 360-degree images):
 
 **Recommended configuration for ~300 images:**
 ```bash
-# Fast upload configuration
+# Fast upload configuration with socket timeout protection
 MAX_CONCURRENT_UPLOADS=20
+FTP_SOCKET_TIMEOUT_MS=30000
 FILE_UPLOAD_MAX_RETRIES=10
 FILE_UPLOAD_INITIAL_BACKOFF_MS=2000
 ```
@@ -90,7 +94,7 @@ FILE_UPLOAD_INITIAL_BACKOFF_MS=2000
 This script works great with Bun.sh and benefits from Bun's faster I/O performance. However, **Bun Workers are not recommended** for this use case because:
 
 - FTP uploads are **I/O-bound** (network limited), not CPU-bound
-- The script already uses optimal async parallelism with connection pooling
+- The script already uses optimal async parallelism with dedicated connections per file
 - Workers would add overhead without performance benefits
 - Bun's native async I/O is already faster than Node.js
 
@@ -155,12 +159,14 @@ Both errors are automatically retried using the exponential backoff strategy.
 ## How It Works
 
 1. Script checks for a lock file to prevent concurrent executions
-2. Creates lock file and connects to FTP server
+2. Creates lock file and connects to FTP server with configured socket timeout
 3. Scans configured local directories for folders to upload
 4. For each folder:
    - Checks that all files are stable (not currently being written)
    - Uploads files in parallel (respecting concurrency limits)
+   - Each file upload creates a dedicated FTP connection with timeout protection
    - Each file upload is wrapped with retry logic
+   - Connections are closed immediately after each file upload
    - Deletes local folder after successful upload
 5. Removes lock file when complete
 
