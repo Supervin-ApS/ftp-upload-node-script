@@ -414,17 +414,18 @@ async function uploadFileToS3(
       const client = clientPool.getClient();
       
       try {
-        const fileStream = fs.createReadStream(file);
         const stats = await fs.promises.stat(file);
         
         // Use multipart upload for files larger than 5MB
         if (stats.size > 5 * 1024 * 1024) {
+          const fileStream = fs.createReadStream(file);
           const upload = new Upload({
             client,
             params: {
               Bucket: bucket,
               Key: s3Key,
               Body: fileStream,
+              ContentLength: stats.size,
             },
             queueSize: 4,
             partSize: 5 * 1024 * 1024, // 5MB parts
@@ -434,11 +435,12 @@ async function uploadFileToS3(
           await upload.done();
         } else {
           // Use simple upload for smaller files
+          // Read file into buffer to avoid Content-Length mismatch issues with streams
+          const fileBuffer = await fs.promises.readFile(file);
           const command = new PutObjectCommand({
             Bucket: bucket,
             Key: s3Key,
-            Body: fileStream,
-            ContentLength: stats.size,
+            Body: fileBuffer,
           });
           
           await client.send(command);

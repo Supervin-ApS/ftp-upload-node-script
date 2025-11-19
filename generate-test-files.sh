@@ -17,98 +17,40 @@ rm -rf websiteImages/folder* 360Images/folder*
 # Create websiteImages test structure
 echo "Creating websiteImages test structure..."
 
-# Folder 1 - with subfolder
-mkdir -p websiteImages/folder1/subfolder
-cat > websiteImages/folder1/image1.txt << 'EOF'
-This is a test file simulating an image upload.
-Folder: folder1
-File: image1.txt
-Timestamp: $(date -Iseconds)
-EOF
+# Folder 1 - Many small files (simulating production load)
+mkdir -p websiteImages/folder1
+echo "Generating 500 small files in websiteImages/folder1..."
+for i in {1..500}; do
+    echo "This is small file number $i - $(date)" > "websiteImages/folder1/small_file_$i.txt"
+done
 
-cat > websiteImages/folder1/image2.txt << 'EOF'
-This is a test file simulating an image upload.
-Folder: folder1
-File: image2.txt
-Timestamp: $(date -Iseconds)
-EOF
-
-cat > websiteImages/folder1/subfolder/image3.txt << 'EOF'
-This is a test file in a subfolder.
-Folder: folder1/subfolder
-File: image3.txt
-Timestamp: $(date -Iseconds)
-EOF
-
-# Folder 2
+# Folder 2 - Mixed sizes
 mkdir -p websiteImages/folder2
-cat > websiteImages/folder2/product1.txt << 'EOF'
-This is a test file simulating an image upload.
-Folder: folder2
-File: product1.txt
-Timestamp: $(date -Iseconds)
-EOF
+echo "Generating mixed sized files in websiteImages/folder2..."
 
-cat > websiteImages/folder2/product2.txt << 'EOF'
-This is a test file simulating an image upload.
-Folder: folder2
-File: product2.txt
-Timestamp: $(date -Iseconds)
-EOF
+# Create a 6MB file (just over 5MB threshold)
+echo "Creating 6MB file..."
+dd if=/dev/urandom of=websiteImages/folder2/large_file_6mb.bin bs=1M count=6 2>/dev/null
 
-cat > websiteImages/folder2/product3.txt << 'EOF'
-This is a test file simulating an image upload.
-Folder: folder2
-File: product3.txt
-Timestamp: $(date -Iseconds)
-EOF
+# Create a 12MB file
+echo "Creating 12MB file..."
+dd if=/dev/urandom of=websiteImages/folder2/large_file_12mb.bin bs=1M count=12 2>/dev/null
+
+# Create some medium files (1MB)
+echo "Creating 5 medium files (1MB)..."
+for i in {1..5}; do
+    dd if=/dev/urandom of="websiteImages/folder2/medium_file_${i}_1mb.bin" bs=1M count=1 2>/dev/null
+done
 
 # Create 360Images test structure
 echo "Creating 360Images test structure..."
 
-# Folder 3
+# Folder 3 - 360 images simulation
 mkdir -p 360Images/folder3
-cat > 360Images/folder3/panorama1.txt << 'EOF'
-This is a test file simulating a 360-degree image upload.
-Folder: folder3
-File: panorama1.txt
-Timestamp: $(date -Iseconds)
-Type: 360-degree panorama
-EOF
-
-cat > 360Images/folder3/panorama2.txt << 'EOF'
-This is a test file simulating a 360-degree image upload.
-Folder: folder3
-File: panorama2.txt
-Timestamp: $(date -Iseconds)
-Type: 360-degree panorama
-EOF
-
-cat > 360Images/folder3/panorama3.txt << 'EOF'
-This is a test file simulating a 360-degree image upload.
-Folder: folder3
-File: panorama3.txt
-Timestamp: $(date -Iseconds)
-Type: 360-degree panorama
-EOF
-
-# Folder 4 - with nested structure
-mkdir -p 360Images/folder4/room1 360Images/folder4/room2
-cat > 360Images/folder4/room1/view1.txt << 'EOF'
-This is a test file simulating a 360-degree image upload.
-Folder: folder4/room1
-File: view1.txt
-Timestamp: $(date -Iseconds)
-Type: 360-degree panorama - Room 1
-EOF
-
-cat > 360Images/folder4/room2/view2.txt << 'EOF'
-This is a test file simulating a 360-degree image upload.
-Folder: folder4/room2
-File: view2.txt
-Timestamp: $(date -Iseconds)
-Type: 360-degree panorama - Room 2
-EOF
+echo "Generating 100 files in 360Images/folder3..."
+for i in {1..100}; do
+    echo "This is 360 panorama file number $i" > "360Images/folder3/pano_$i.txt"
+done
 
 echo -e "${GREEN}✓ Test files generated successfully!${NC}"
 echo ""
