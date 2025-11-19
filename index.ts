@@ -75,21 +75,74 @@ interface DirectoryPair {
   description: string;
 }
 
-// Define our directory pairs
-const DIRECTORY_PAIRS: DirectoryPair[] = [
-  {
-    localDir: process.env.LOCAL_DIR_IMAGES || "./websiteImages",
-    bucket: process.env.S3_BUCKET_IMAGES || "images",
-    prefix: process.env.S3_PREFIX_IMAGES || "testImages",
-    description: "Regular Images"
-  },
-  {
-    localDir: process.env.LOCAL_DIR_360 || "./360Images",
-    bucket: process.env.S3_BUCKET_360 || "images-360", 
-    prefix: process.env.S3_PREFIX_360 || "360Images",
-    description: "360-degree Images"
+/**
+ * Loads directory pairs from environment variables.
+ * Uses numbered format: DIR_PAIR_1_LOCAL, DIR_PAIR_1_BUCKET, etc.
+ * 
+ * Required fields: LOCAL, BUCKET
+ * Optional fields: PREFIX (defaults to empty string), DESC (defaults to "Directory Pair N")
+ * 
+ * @throws Error if no directory pairs are configured or required fields are missing
+ */
+function loadDirectoryPairs(): DirectoryPair[] {
+  const pairs: DirectoryPair[] = [];
+  let index = 1;
+  
+  // Scan for numbered directory pairs
+  while (true) {
+    const localDir = process.env[`DIR_PAIR_${index}_LOCAL`];
+    const bucket = process.env[`DIR_PAIR_${index}_BUCKET`];
+    const prefix = process.env[`DIR_PAIR_${index}_PREFIX`];
+    const description = process.env[`DIR_PAIR_${index}_DESC`];
+    
+    // Stop when we don't find the next numbered pair
+    if (!localDir && !bucket && !prefix && !description) {
+      break;
+    }
+    
+    // Validate required fields
+    const missingFields: string[] = [];
+    if (!localDir) missingFields.push('LOCAL');
+    if (!bucket) missingFields.push('BUCKET');
+    
+    if (missingFields.length > 0) {
+      throw new Error(
+        `Directory pair ${index} is missing required fields: ${missingFields.map(f => `DIR_PAIR_${index}_${f}`).join(', ')}. ` +
+        `Each directory pair must have at minimum LOCAL and BUCKET defined.`
+      );
+    }
+    
+    pairs.push({
+      localDir: localDir!,
+      bucket: bucket!,
+      prefix: prefix || '',
+      description: description || `Directory Pair ${index}`
+    });
+    
+    index++;
   }
-];
+  
+  // Ensure at least one directory pair is configured
+  if (pairs.length === 0) {
+    throw new Error(
+      'No directory pairs configured. Please define at least one directory pair using environment variables:\n' +
+      '  DIR_PAIR_1_LOCAL=<local-directory-path>\n' +
+      '  DIR_PAIR_1_BUCKET=<s3-bucket-name>\n' +
+      '  DIR_PAIR_1_PREFIX=<s3-prefix> (optional)\n' +
+      '  DIR_PAIR_1_DESC=<description> (optional)'
+    );
+  }
+  
+  console.log(`[${new Date().toISOString()}] Loaded ${pairs.length} directory pair(s):`);
+  pairs.forEach((pair, idx) => {
+    console.log(`  [${idx + 1}] ${pair.description}: ${pair.localDir} -> s3://${pair.bucket}/${pair.prefix}`);
+  });
+  
+  return pairs;
+}
+
+// Load directory pairs from environment variables
+const DIRECTORY_PAIRS: DirectoryPair[] = loadDirectoryPairs();
 
 // File stability threshold (30 seconds by default)
 const FILE_STABILITY_THRESHOLD_MS: number = parseInt(process.env.FILE_STABILITY_THRESHOLD || "30000");
@@ -385,6 +438,7 @@ async function uploadFileToS3(
             Bucket: bucket,
             Key: s3Key,
             Body: fileStream,
+            ContentLength: stats.size,
           });
           
           await client.send(command);
